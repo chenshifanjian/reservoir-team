@@ -378,9 +378,11 @@ def _send(handler, code: int, obj: dict):
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    # 不发任何 CORS 头。桌面客户端是用后端 httpx 调这里，浏览器从不直接调，
+    # 所以 Access-Control-Allow-Origin: * 只是多余的攻击面 —— 它会放行
+    # 任意网页发起的跨域请求（带 Authorization 会走 preflight，而
+    # Allow-Headers 明确放行了 Authorization）。鉴权仍然挡得住，但没必要开门。
+    # 若将来真要做浏览器端的管理界面，再按具体 origin 收紧，不要用 *。
     handler.end_headers()
     handler.wfile.write(body)
 
