@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装依赖
+        run: python -m pip install --upgrade cryptography
+
+      - name: 语法检查
+        run: |
+          python -m py_compile coordinator.py protocol.py
+          bash -n deploy.sh
+
+      # 本工作流不含任何 ${{ github.event.* }} 之类未受信输入，全部为静态字符串，
+      # 不存在命令注入面。
+      - name: 协议一致性（与客户端仓库对比）
+        run: |
+          set -e
+          echo "本仓库 protocol.py:"
+          sha256sum protocol.py
+          # protocol.py 是与客户端仓库共用的密钥派生实现，两份必须字节一致，
+          # 否则会出现「客户端加密、服务端验不过码」。
+          curl -fsSL -o /tmp/client_protocol.py \
+            https://raw.githubusercontent.com/chenshifanjian/model-reservoir/revive/protocol.py
+          if ! diff -q protocol.py /tmp/client_protocol.py > /dev/null; then
+            echo "::error::protocol.py 与客户端仓库不一致（协议漂移）。改协议必须两边同时改。"
+            diff protocol.py /tmp/client_protocol.py || true
+            exit 1
+          fi
+          echo "protocol.py 与客户端仓库一致"
+
+      - name: 跑测试
+        run: python test_coordinator.py
+
+      - name: 脱敏扫描（不得含真实公网主机或口令）
+        run: |
+          set -e
+          echo "--- 检查硬编码公网 IP（排除回环/内网/文档示例）---"
+          # 只查代码与配置，不查 README 里的示例地址
+          if grep -rnE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+              --include='*.py' --include='*.sh' --include='*.conf' --include='*.service' . \
+              | grep -vE '127\.0\.0\.1|0\.0\.0\.0|192\.168\.|10\.[0-9]+\.|172\.(1[6-9]|2[0-9]|3[01])\.|255\.255'; then
+            echo "::error::发现疑似真实公网 IP，请确认是否需要脱敏"
+            exit 1
+          fi
+          echo "--- 检查硬编码 SSH 端口与主机名 ---"
+          # 允许「从环境变量取值」的写法：HOST="${TEAM_HOST:?...}"、PORT="${TEAM_SSH_PORT:-22}"
+          # 只有右侧是裸字面量（如 HOST=1.2.3.4、PORT=22）才算硬编码
+          if grep -rnE '^(HOST|PORT|SVC_PORT|TEAM_SSH_PORT)=' --include='*.sh' . \
+              | grep -vE '\$\{(TEAM_HOST|TEAM_SSH_PORT|TEAM_PORT|TEAM_DIR)'; then
+            echo "::error::deploy.sh 里疑似硬编码了主机或端口，应改为环境变量"
+            exit 1
+          fi
+          echo "--- 检查硬编码口令 ---"
+          if grep -rnE "password\s*=\s*['\"][^'\"]{6,}" --include='*.py' --include='*.sh' .; then
+            echo "::error::发现疑似硬编码口令"
+            exit 1
+          fi
+          echo "脱敏扫描通过"

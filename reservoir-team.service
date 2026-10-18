@@ -1,0 +1,62 @@
+# 组队协调服务 · systemd 单元
+#
+# 部署位置：任意一台你自己的 Linux（本项目开发时用的是 2 核 / 可用内存约 505MiB
+# 的低配 VPS，所以下面的约束按「小内存机器也能稳」来写）
+#   1) 本文件 → /etc/systemd/system/reservoir-team.service
+#   2) coordinator.py → /opt/reservoir-team/coordinator.py
+#   3) systemctl daemon-reload && systemctl enable --now reservoir-team
+#
+# 内存约束：小内存机器上，所以
+#   - 不用 Docker（Docker 本身吃内存）
+#   - 不用 fastapi/uvicorn（要装包，且常驻内存更大）
+#   - 直接跑标准库 HTTP server；下面 MemoryMax 是硬保险，超了会被 OOM 杀掉重启，
+#     而不是拖垮同机的 frps（校园隧道靠它活着，绝不能被牵连）
+
+[Unit]
+Description=Model Reservoir 组队协调服务（只做协调面，不见明文密钥）
+Documentation=file:/opt/reservoir-team/coordinator.py
+After=network-online.target
+Wants=network-online.target
+# 绝不依赖/影响 frps —— 那是另一条业务线
+Conflicts=
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/reservoir-team
+ExecStart=/usr/bin/python3 /opt/reservoir-team/coordinator.py /opt/reservoir-team/team.db 5022
+
+# 优雅退出：SIGTERM → 服务自己 shutdown，关闭 SQLite
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+# ---- 资源硬限制（关键）----
+# 协调服务本身只吃 ~15MiB；给 128MiB 上限足够，且保证饿不死也抢不走别人的
+MemoryMax=128M
+MemoryHigh=96M
+TasksMax=32
+
+# ---- 加固（它不需要任何特权）----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+# 只允许写自己的数据目录（SQLite 落盘处）
+ReadWritePaths=/opt/reservoir-team
+
+# ---- 日志 ----
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reservoir-team
+
+[Install]
+WantedBy=multi-user.target

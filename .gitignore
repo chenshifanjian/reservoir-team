@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+_test.db
+_test.db-*
+team.db
+team.db-*
+*.log
+.venv/
+venv/
