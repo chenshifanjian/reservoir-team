@@ -123,6 +123,58 @@ def main():
         c, b = api.get(f"/api/teams/{tid}/usage", cap_tok)
         check("队长看用量统计", c == 200 and len(b.get("by_member", [])) == 1)
 
+        # ---- 共享池：队员也能上传，广播包全队可取 ----
+        salt_p = secrets.token_bytes(32).hex()
+        c, b = api.post("/api/teams", {"captain_client_id": "cap-p",
+                                       "code_hash": protocol.code_hash(CODE, salt_p),
+                                       "code_salt": salt_p, "ttl": 600, "nickname": "队长2"})
+        tid_p, cap_p = b["team_id"], b["token"]
+        c, b = api.post("/api/teams/join", {"team_id": tid_p, "code": CODE,
+                                            "client_id": "mem-p", "nickname": "队员2"})
+        mem_p = b["token"]
+        api.post(f"/api/teams/{tid_p}/approve", {"client_id": "mem-p"}, token=cap_p)
+
+        n_hex = secrets.token_bytes(12).hex()
+        pl_hex = secrets.token_bytes(64).hex()
+        c, b = api.post(f"/api/teams/{tid_p}/packages",
+                        {"provider_name": "Groq", "target_client_id": "",
+                         "nonce": n_hex, "payload": pl_hex}, token=mem_p)
+        check("队员能上传广播包", c == 200 and b.get("ok") is True, f"HTTP={c} {b}")
+
+        c, b = api.get(f"/api/teams/{tid_p}/packages", cap_p)
+        got = [p for p in b.get("packages", []) if p["provider_name"] == "Groq"]
+        check("队长能拉到队员的广播包", len(got) == 1, f"HTTP={c}")
+        check("contributor 记录贡献者",
+              bool(got) and got[0].get("contributor_client_id") == "mem-p",
+              str(got)[:110])
+        c, b = api.get(f"/api/teams/{tid_p}/packages", mem_p)
+        check("队员自己也拉得到全队广播包",
+              any(p["provider_name"] == "Groq" for p in b.get("packages", [])), f"HTTP={c}")
+
+        # 未批准的成员不能上传
+        c, b = api.post("/api/teams/join", {"team_id": tid_p, "code": CODE,
+                                            "client_id": "mem-w", "nickname": "未批准"})
+        c, b = api.post(f"/api/teams/{tid_p}/packages",
+                        {"provider_name": "X", "target_client_id": "",
+                         "nonce": n_hex, "payload": pl_hex}, token=b["token"])
+        check("未批准成员不能上传", c == 403, f"HTTP={c}")
+        api.post(f"/api/teams/{tid_p}/close", {}, token=cap_p)
+
+        # ---- 永久队伍：ttl<=0 ----
+        salt_m = secrets.token_bytes(32).hex()
+        c, b = api.post("/api/teams", {"captain_client_id": "cap-m",
+                                       "code_hash": protocol.code_hash(CODE, salt_m),
+                                       "code_salt": salt_m, "ttl": 0, "nickname": "队长3"})
+        check("ttl=0 建队成功", c == 200 and bool(b.get("team_id")), f"HTTP={c}")
+        check("返回 permanent=true", b.get("permanent") is True, str(b)[:110])
+        check("expires_at=0", b.get("expires_at") == 0, str(b.get("expires_at")))
+        tid_m, tok_m = b["team_id"], b["token"]
+        c, b = api.get(f"/api/teams/{tid_m}/state", tok_m)
+        check("永久队伍仍判为存活", c == 200 and b.get("alive") is True,
+              f"HTTP={c} {str(b)[:90]}")
+        c, _ = api.post(f"/api/teams/{tid_m}/close", {}, token=tok_m)
+        check("永久队伍队长仍可关闭", c == 200)
+
         # 过期清理
         con = sqlite3.connect(db)
         con.execute("UPDATE teams SET expires_at = strftime('%s','now') - 86400 "
@@ -130,9 +182,12 @@ def main():
         con.commit()
         con.close()
         st = __import__("coordinator").Store(str(db))
+        st.create_team("perm-keep", "cap-z", "c" * 64, "d" * 64, 600, permanent=True)
         removed = st.purge_expired()
+        alive = {r["team_id"] for r in st.conn.execute("SELECT team_id FROM teams").fetchall()}
         st.conn.close()
         check("过期队伍清理", removed >= 1)
+        check("永久队伍未被清理", "perm-keep" in alive, str(alive)[:110])
 
     finally:
         srv.terminate()

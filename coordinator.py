@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS packages (
     provider_name     TEXT NOT NULL,
     payload           BLOB NOT NULL,                  -- AESGCM 密文
     nonce             BLOB NOT NULL,
+    contributor_client_id TEXT NOT NULL DEFAULT '',   -- 谁贡献的（共享池要显示「来自谁」）
     created_at        REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS usage_log (
@@ -143,10 +144,24 @@ CREATE TABLE IF NOT EXISTS create_attempts (
     ts REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pkg_target ON packages(team_id, target_client_id);
+CREATE INDEX IF NOT EXISTS idx_pkg_contrib ON packages(team_id, contributor_client_id);
 CREATE INDEX IF NOT EXISTS idx_usage_team ON usage_log(team_id, client_id);
 CREATE INDEX IF NOT EXISTS idx_attempt ON join_attempts(team_id, ip, ts);
 CREATE INDEX IF NOT EXISTS idx_create ON create_attempts(ip, ts);
 """
+
+
+def team_expired(team) -> bool:
+    """队伍是否已过期。
+
+    expires_at == 0 表示**永久队伍**，永不判过期。
+    这个判定必须集中在这里：散落的 `time.time() > expires_at`
+    在永久队伍上永远为真（now > 0），会把好好的队伍判死。
+    """
+    if not team:
+        return True
+    exp = team["expires_at"]
+    return exp > 0 and time.time() > exp
 
 
 class Store:
@@ -157,8 +172,25 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         with DB_LOCK:
+            # 顺序要紧：先补列再跑 SCHEMA。SCHEMA 里有针对新列的
+            # CREATE INDEX，反过来会让没有该列的老库直接 no such column 崩掉。
+            self._migrate()
             self.conn.executescript(SCHEMA)
             self.conn.commit()
+
+    def _migrate(self):
+        """老库补列。CREATE TABLE IF NOT EXISTS 不会给已有表加列，
+        所以升级部署必须单独补 —— 否则线上老库插入会直接报错。"""
+        # PRAGMA 对不存在的表**不抛异常，返回空集**，所以只能看行数，
+        # 用 try/except 抓不到「表还不存在」这种情况。
+        rows = self.conn.execute("PRAGMA table_info(packages)").fetchall()
+        if not rows:
+            return        # 全新库，表还不存在，下面 SCHEMA 会建
+        cols = {r["name"] for r in rows}
+        if "contributor_client_id" not in cols:
+            self.conn.execute(
+                "ALTER TABLE packages ADD COLUMN contributor_client_id "
+                "TEXT NOT NULL DEFAULT ''")
 
     # ---- 限流 ----
     def check_rate_limit(self, team_id: str, ip: str) -> bool:
@@ -210,7 +242,9 @@ class Store:
         now = time.time()
         with DB_LOCK:
             ids = [r["team_id"] for r in self.conn.execute(
-                "SELECT team_id FROM teams WHERE expires_at < ?", (now,)).fetchall()]
+                # expires_at=0 是永久队伍，不能进清理列表
+                "SELECT team_id FROM teams WHERE expires_at > 0 AND expires_at < ?",
+                (now,)).fetchall()]
             for tid in ids:
                 self.conn.execute("DELETE FROM members WHERE team_id=?", (tid,))
                 self.conn.execute("DELETE FROM packages WHERE team_id=?", (tid,))
@@ -228,13 +262,15 @@ class Store:
             self.conn.commit()
 
     # ---- 队伍 ----
-    def create_team(self, team_id, captain_client_id, code_hash, code_salt, ttl):
+    def create_team(self, team_id, captain_client_id, code_hash, code_salt, ttl,
+                    permanent=False):
         now = time.time()
         with DB_LOCK:
             self.conn.execute(
                 "INSERT INTO teams(team_id,captain_client_id,code_hash,code_salt,"
                 "status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
-                (team_id, captain_client_id, code_hash, code_salt, "open", now, now + ttl),
+                (team_id, captain_client_id, code_hash, code_salt, "open", now,
+                 0 if permanent else now + ttl),   # expires_at=0 表示永久
             )
             self.conn.commit()
 
@@ -301,26 +337,34 @@ class Store:
             self.conn.commit()
 
     # ---- 密文包 ----
-    def add_package(self, team_id, target_client_id, provider_name, payload, nonce):
+    def add_package(self, team_id, target_client_id, contributor_client_id,
+                    provider_name, payload, nonce):
         with DB_LOCK:
+            # 限额按**贡献者**算，不是按 target。广播包（target=''）是全队共享的，
+            # 若按 target 计数，14 个人的广播包会挤进同一个 64 条的桶里被卡死。
             cnt = self.conn.execute(
-                "SELECT COUNT(*) c FROM packages WHERE team_id=? AND target_client_id=?",
-                (team_id, target_client_id),
+                "SELECT COUNT(*) c FROM packages WHERE team_id=? AND contributor_client_id=?",
+                (team_id, contributor_client_id),
             ).fetchone()["c"]
             if cnt >= MAX_PACKAGES_PER_MEMBER:
                 return False
             self.conn.execute(
                 "INSERT INTO packages(team_id,target_client_id,provider_name,payload,"
-                "nonce,created_at) VALUES(?,?,?,?,?,?)",
-                (team_id, target_client_id, provider_name, payload, nonce, time.time()),
+                "nonce,contributor_client_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                (team_id, target_client_id, provider_name, payload, nonce,
+                 contributor_client_id, time.time()),
             )
             self.conn.commit()
         return True
 
     def list_packages(self, team_id, target_client_id):
         rows = self.conn.execute(
-            "SELECT provider_name,payload,nonce,created_at FROM packages "
-            "WHERE team_id=? AND target_client_id=?", (team_id, target_client_id)
+            # 广播包（target_client_id=''）全队都能取，定向包只给指定的人。
+            # contributor 一并返回，UI 靠它显示「来自某某」。
+            "SELECT provider_name,payload,nonce,contributor_client_id,created_at "
+            "FROM packages "
+            "WHERE team_id=? AND (target_client_id='' OR target_client_id=?)",
+            (team_id, target_client_id)
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -417,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
         t = self.STORE().get_team(team_id)
         if not t:
             return None, 404
-        if t["status"] != "open" or time.time() > t["expires_at"]:
+        if t["status"] != "open" or team_expired(t):
             return None, 410          # Gone：队伍已关闭或过期
         return t, None
 
@@ -453,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "state":
                 # 队员轮询：拿队伍状态 + 成员表 + 自己是否还被认可
                 team = self.STORE().get_team(team_id)
-                alive = bool(team) and team["status"] == "open" and time.time() <= team["expires_at"]
+                alive = bool(team) and team["status"] == "open" and not team_expired(team)
                 _send(self, 200, {
                     "ok": True, "alive": alive,
                     "status": team["status"] if team else "closed",
@@ -469,6 +513,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"provider_name": p["provider_name"],
                      "nonce": p["nonce"].hex(),
                      "payload": p["payload"].hex(),
+                     "contributor_client_id": p["contributor_client_id"],
                      "created_at": p["created_at"]} for p in pkgs]})
                 return
 
@@ -502,22 +547,38 @@ class Handler(BaseHTTPRequestHandler):
             # 直接 int() 会让 "abc" 抛 ValueError → 连接被掐断（RemoteDisconnected）；
             # 负数则建出即过期的废队伍。
             try:
-                ttl = int(body.get("ttl") or CODE_TTL_DEFAULT)
+                # 不能写成 `body.get("ttl") or CODE_TTL_DEFAULT`：
+                # ttl=0 是「永久」的合法取值，而 0 是 falsy，会被当成没传
+                # 从而落回默认 7 天 —— 永久队伍永远建不出来。
+                raw_ttl = body.get("ttl")
+                ttl = CODE_TTL_DEFAULT if raw_ttl is None else int(raw_ttl)
             except (TypeError, ValueError):
                 _send(self, 400, {"ok": False, "error": "bad_request"})
                 return
-            ttl = max(TEAM_TTL_MIN, min(ttl, TEAM_TTL_MAX))
+            # 三个语义要分清，不能合并成 `ttl <= 0`：
+            #   不传      → 默认 7 天
+            #   ttl == 0  → 永久（不过期，队长可随时关闭或轮换入队码）
+            #   ttl <  0  → 非法输入，直接拒。当成永久等于把客户端 bug
+            #               或恶意输入变成「永不回收的开放队伍」。
+            if ttl < 0:
+                _send(self, 400, {"ok": False, "error": "bad_request"})
+                return
+            permanent = ttl == 0
+            if not permanent:
+                ttl = max(TEAM_TTL_MIN, min(ttl, TEAM_TTL_MAX))
             nickname = str(body.get("nickname") or "队长")[:MAX_NICKNAME_LEN]
             if not captain_client_id or len(code_hash) != 64 or len(code_salt) != 64:
                 _send(self, 400, {"ok": False, "error": "bad_request"})
                 return
             self.STORE().record_create(ip)
             token = secrets.token_urlsafe(32)
-            self.STORE().create_team(team_id, captain_client_id, code_hash, code_salt, ttl)
+            self.STORE().create_team(
+                team_id, captain_client_id, code_hash, code_salt, ttl, permanent)
             self.STORE().add_member(team_id, captain_client_id, nickname, "captain",
                                   "approved", hash_token(token))
             _send(self, 200, {"ok": True, "team_id": team_id, "token": token,
-                              "expires_at": time.time() + ttl})
+                              "expires_at": 0 if permanent else time.time() + ttl,
+                              "permanent": permanent})
             return
 
         # ---- /api/teams/join  输码加入 ----
@@ -534,7 +595,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             t = self.STORE().get_team(team_id)
-            if not t or t["status"] != "open" or time.time() > t["expires_at"]:
+            if not t or t["status"] != "open" or team_expired(t):
                 _send(self, 410, {"ok": False, "error": "team_unavailable"})
                 return
             if not self.STORE().check_rate_limit(team_id, ip):
@@ -645,9 +706,12 @@ class Handler(BaseHTTPRequestHandler):
                 _send(self, 200, {"ok": True})
                 return
 
-            if action == "packages":     # 队长上传密文包（服务端无法解密）
-                if m["role"] != "captain":
-                    _send(self, 403, {"ok": False, "error": "captain_only"})
+            if action == "packages":     # 上传密文包（服务端无法解密）
+                # 共享池：任何已批准成员都能贡献，不只是队长。
+                # 队长与队员的差别在于**白名单**（客户端侧），
+                # 不在于能不能往池子里放东西。
+                if m["status"] != "approved":
+                    _send(self, 403, {"ok": False, "error": "not_approved"})
                     return
                 if not t or t["status"] != "open":
                     _send(self, 410, {"ok": False, "error": "team_unavailable"})
@@ -663,11 +727,15 @@ class Handler(BaseHTTPRequestHandler):
                 if len(nonce) != 12 or not payload or len(payload) > 65536 or not pname:
                     _send(self, 400, {"ok": False, "error": "bad_request"})
                     return
-                tgt = self.STORE().get_member(team_id, target)
-                if not tgt or tgt["status"] != "approved":
-                    _send(self, 404, {"ok": False, "error": "member_not_found"})
-                    return
-                if not self.STORE().add_package(team_id, target, pname, payload, nonce):
+                # target 为空 = 广播给全队（用 K_team 加密，任何人都能解）。
+                # 非空时必须确实存在且已批准，否则密文永远没人能取走。
+                if target:
+                    tgt = self.STORE().get_member(team_id, target)
+                    if not tgt or tgt["status"] != "approved":
+                        _send(self, 404, {"ok": False, "error": "member_not_found"})
+                        return
+                if not self.STORE().add_package(
+                        team_id, target, m["client_id"], pname, payload, nonce):
                     _send(self, 409, {"ok": False, "error": "package_limit"})
                     return
                 _send(self, 200, {"ok": True, "stored": self.STORE().count_packages(team_id)})

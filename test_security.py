@@ -149,14 +149,24 @@ def test_ttl_validation(srv):
                                    "code_salt": "b" * 64, "ttl": "abc"})
     assert c == 400, f"ttl 字符串应 400（不能是连接被掐断），HTTP={c}"
 
+    # 负 ttl 直接拒（400），不再 clamp 成 5 分钟。
+    # 负数是客户端 bug 或恶意输入；静默 clamp 会把 bug 藏起来，
+    # 而安全属性「不建出即过期的废队伍」依然成立 —— 拒绝比容忍更强。
+    # 注意 ttl=0 是另一回事：那是**永久队伍**的合法取值，必须放行。
     c, _ = api.post("/api/teams", {"captain_client_id": "x2", "code_hash": "a" * 64,
                                    "code_salt": "b" * 64, "ttl": -999999})
-    assert c == 200
+    assert c == 400, f"负 ttl 应 400，HTTP={c}"
     import sqlite3
     n = sqlite3.connect(db).execute(
-        "SELECT COUNT(*) FROM teams WHERE captain_client_id='x2' "
-        "AND expires_at < strftime('%s','now')").fetchone()[0]
-    assert n == 0, "负 ttl 不应建出已过期的废队伍"
+        "SELECT COUNT(*) FROM teams WHERE captain_client_id='x2'").fetchone()[0]
+    assert n == 0, "负 ttl 不应建出任何队伍"
+
+    c, _ = api.post("/api/teams", {"captain_client_id": "x3", "code_hash": "a" * 64,
+                                   "code_salt": "b" * 64, "ttl": 0})
+    assert c == 200, f"ttl=0（永久）应放行，HTTP={c}"
+    row = sqlite3.connect(db).execute(
+        "SELECT expires_at FROM teams WHERE captain_client_id='x3'").fetchone()
+    assert row and row[0] == 0, f"ttl=0 应存 expires_at=0，实际 {row}"
 
 
 def test_create_rate_limit(srv):

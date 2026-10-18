@@ -5,6 +5,7 @@
 - 协调服务**只**需要 code_hash 来校验入队码，它不持有 code，因此派生不出 K_team
 - K_team 绑定 team_id：同一个码在不同队伍里派生出不同密钥
 - K_member 绑定 member_client_id：一个队员解不开别人的包
+- 广播通道直接用 K_team：共享池里任一队员都能解（见文件末尾）
 
 部署：本文件随 coordinator.py 一起放到 /opt/reservoir-team/（deploy.sh 会一并上传）。
 """
@@ -57,3 +58,23 @@ def decrypt_as_member(team_key: bytes, member_client_id: str, nonce: bytes, ciph
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     key = derive_member_key(team_key, member_client_id)
     return AESGCM(key).decrypt(nonce, ciphertext, None)
+
+# ============================================================
+# 全队广播（共享池）
+# ============================================================
+# 共享池里任何队员都能解，所以直接用 K_team，不做按人派生。
+# 注意：广播意味着**全队可见** —— 客户端上传前必须先过队长白名单，
+# 白名单不过的内容绝不能进这条通道。定向包（上面那对函数）仍然
+# 用于「只给某一个人」的场景。
+
+def encrypt_broadcast(team_key: bytes, plaintext: bytes) -> tuple[bytes, bytes]:
+    """返回 (nonce, ciphertext)，全队任一成员都能解。"""
+    import os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    return nonce, AESGCM(team_key).encrypt(nonce, plaintext, None)
+
+
+def decrypt_broadcast(team_key: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    return AESGCM(team_key).decrypt(nonce, ciphertext, None)
