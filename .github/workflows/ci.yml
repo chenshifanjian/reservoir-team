@@ -18,7 +18,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: 安装依赖
-        run: python -m pip install --upgrade cryptography
+        run: python -m pip install --upgrade cryptography pytest
 
       - name: 语法检查
         run: |
@@ -43,8 +43,11 @@ jobs:
           fi
           echo "protocol.py 与客户端仓库一致"
 
-      - name: 跑测试
+      - name: 跑自测（无 pytest 依赖）
         run: python test_coordinator.py
+
+      - name: 跑安全回归
+        run: python -m pytest test_security.py -q
 
       - name: 脱敏扫描（不得含真实公网主机或口令）
         run: |
