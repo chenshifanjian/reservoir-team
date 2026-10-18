@@ -47,7 +47,9 @@ RPRECHECK
 step "1) 上传协调服务与单元文件"
 "${SSH[@]}" "mkdir -p $REMOTE_DIR"
 "${SCP[@]}" "$LOCAL_DIR/coordinator.py" "root@$HOST:$REMOTE_DIR/coordinator.py"
-"${SCP[@]}" "$LOCAL_DIR/../protocol.py" "root@$HOST:$REMOTE_DIR/protocol.py"
+# protocol.py 在本仓库里与 deploy.sh 同级（拆分前它在 team/ 的上一级，
+# 所以旧写法是 ../protocol.py；拆分时漏改了这个路径）
+"${SCP[@]}" "$LOCAL_DIR/protocol.py" "root@$HOST:$REMOTE_DIR/protocol.py"
 echo "  已上传 coordinator.py + protocol.py（密钥派生协议，两边共用避免漂移）"
 # 单元文件里的端口与数据目录按本次部署注入（源文件保持通用模板）
 UNIT_TMP="$(mktemp)"
